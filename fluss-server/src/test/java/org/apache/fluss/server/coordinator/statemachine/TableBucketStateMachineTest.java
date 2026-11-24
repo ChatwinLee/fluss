@@ -40,6 +40,7 @@ import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.remote.RemoteDirDynamicLoader;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.ControlledShutdownLeaderElection;
 import org.apache.fluss.server.coordinator.statemachine.TableBucketStateMachine.ElectionResult;
+import org.apache.fluss.server.entity.RegisterTableBucketLeadAndIsrInfo;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.zk.CuratorFrameworkWithUnhandledErrorListener;
@@ -401,6 +402,72 @@ class TableBucketStateMachineTest {
         // check the zk node that the leader has changed
         // the leader should be 1 as 1 is live, the epoch should be 1 as we elect a new leader
         CoordinatorTestUtils.checkLeaderAndIsr(zookeeperClient, tableBucket1, 1, 1);
+    }
+
+    @Test
+    void testNewBucketRemainsNewWhenNoReplicaIsAlive() {
+        TableBucketStateMachine stateMachine = createTableBucketStateMachine();
+        TablePath tablePath = TablePath.of("db1", "retry-test");
+        long tableId = 20;
+        TableBucket bucket = new TableBucket(tableId, 0);
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        tablePath,
+                        tableId,
+                        0,
+                        DATA1_TABLE_DESCRIPTOR,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+        coordinatorContext.putTablePath(tableId, tablePath);
+        coordinatorContext.updateBucketReplicaAssignment(bucket, Arrays.asList(0, 1));
+        coordinatorContext.putBucketState(bucket, NewBucket);
+        coordinatorContext.setLiveTabletServers(createServers(Collections.emptyList()));
+        stateMachine.triggerOnlineBucketStateChange();
+        assertThat(coordinatorContext.getBucketState(bucket)).isEqualTo(NewBucket);
+        assertThat(coordinatorContext.getBucketLeaderAndIsr(bucket)).isEmpty();
+    }
+
+    @Test
+    void testNewBucketCanRecoverAfterRegisterFailure() throws Exception {
+        long tableId = 21;
+        TablePath tablePath = TablePath.of("db1", "retry-register");
+        TableBucket bucket = new TableBucket(tableId, 0);
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        tablePath,
+                        tableId,
+                        0,
+                        DATA1_TABLE_DESCRIPTOR,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+        coordinatorContext.putTablePath(tableId, tablePath);
+        coordinatorContext.updateBucketReplicaAssignment(bucket, Arrays.asList(0, 1));
+        coordinatorContext.putBucketState(bucket, NewBucket);
+        coordinatorContext.setLiveTabletServers(createServers(Arrays.asList(0, 1)));
+        makeSendLeaderAndStopRequestAlwaysSuccess(
+                coordinatorContext, testCoordinatorChannelManager);
+        try (TestingZooKeeperClient testingClient =
+                new TestingZooKeeperClient(Collections.emptyMap(), Collections.emptyMap(), false)) {
+            testingClient.failBatchRegister = true;
+            testingClient.failIndividualRegister = true;
+            TableBucketStateMachine stateMachine =
+                    new TableBucketStateMachine(
+                            coordinatorContext, coordinatorRequestBatch, testingClient);
+            // First attempt: both batch and individual registration fail.
+            stateMachine.triggerOnlineBucketStateChange();
+            assertThat(coordinatorContext.getBucketState(bucket)).isEqualTo(NewBucket);
+            assertThat(testingClient.batchRegisterAttempts).isEqualTo(1);
+            assertThat(testingClient.individualRegisterAttempts).isEqualTo(1);
+            // Second attempt: batch still fails, but individual registration succeeds.
+            testingClient.failIndividualRegister = false;
+            stateMachine.triggerOnlineBucketStateChange();
+            assertThat(coordinatorContext.getBucketState(bucket)).isEqualTo(OnlineBucket);
+            assertThat(testingClient.batchRegisterAttempts).isEqualTo(2);
+            assertThat(testingClient.individualRegisterAttempts).isEqualTo(2);
+            assertThat(testingClient.registeredLeaderAndIsrs).containsKey(bucket);
+        }
     }
 
     @Test
@@ -827,6 +894,10 @@ class TableBucketStateMachineTest {
         private final Map<TableBucket, Integer> individualUpdateZkVersions = new HashMap<>();
         private final Map<TableBucket, LeaderAndIsr> registeredLeaderAndIsrs = new HashMap<>();
         private int batchUpdateZkVersion;
+        private boolean failBatchRegister;
+        private boolean failIndividualRegister;
+        private int batchRegisterAttempts;
+        private int individualRegisterAttempts;
 
         private TestingZooKeeperClient(
                 Map<TableBucket, LeaderAndIsr> batchReadResults,
@@ -870,8 +941,23 @@ class TableBucketStateMachineTest {
 
         @Override
         public void registerLeaderAndIsr(
-                TableBucket tableBucket, LeaderAndIsr leaderAndIsr, int expectedZkVersion) {
+                TableBucket tableBucket, LeaderAndIsr leaderAndIsr, int expectedZkVersion)
+                throws Exception {
+            individualRegisterAttempts++;
+            if (failIndividualRegister) {
+                throw new RuntimeException("Expected individual register failure");
+            }
             registeredLeaderAndIsrs.put(tableBucket, leaderAndIsr);
+        }
+
+        @Override
+        public void batchRegisterLeaderAndIsrForTablePartition(
+                List<RegisterTableBucketLeadAndIsrInfo> registerList, int expectedZkVersion)
+                throws Exception {
+            batchRegisterAttempts++;
+            if (failBatchRegister) {
+                throw new RuntimeException("Expected batch register failure");
+            }
         }
 
         private static CuratorFrameworkWithUnhandledErrorListener createCuratorFrameworkWrapper() {

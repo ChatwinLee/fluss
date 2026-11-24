@@ -97,6 +97,7 @@ import org.apache.fluss.server.coordinator.event.RecoverRebalanceEvent;
 import org.apache.fluss.server.coordinator.event.RemoveServerTagByRackEvent;
 import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
 import org.apache.fluss.server.coordinator.event.ResumeDropEvent;
+import org.apache.fluss.server.coordinator.event.RetryNewBucketEvent;
 import org.apache.fluss.server.coordinator.event.RetryOfflineLeaderEvent;
 import org.apache.fluss.server.coordinator.event.SchemaChangeEvent;
 import org.apache.fluss.server.coordinator.event.TableRegistrationChangeEvent;
@@ -107,6 +108,7 @@ import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.rebalance.RebalanceExecutor;
 import org.apache.fluss.server.coordinator.rebalance.RebalanceManager;
 import org.apache.fluss.server.coordinator.remote.RemoteStorageCleaner;
+import org.apache.fluss.server.coordinator.statemachine.BucketState;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.ControlledShutdownLeaderElection;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.ReassignmentLeaderElection;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaStateMachine;
@@ -206,12 +208,14 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
     private final RebalanceManager rebalanceManager;
     private final Scheduler scheduler;
     private final long offlineLeaderRetryDelayMs;
+    private final long newBucketRetryDelayMs;
     private final CompletedSnapshotStoreManager completedSnapshotStoreManager;
     private final LakeTableHelper lakeTableHelper;
     // Tracks the exact assignment last confirmed in ZooKeeper for an active rebalance bucket. A
     // write attempt invalidates the entry before it starts.
     private final Map<TableBucket, List<Integer>> assignmentPersistenceByBucket = new HashMap<>();
     private ScheduledFuture<?> offlineLeaderRetryTask;
+    private ScheduledFuture<?> newBucketRetryTask;
 
     public CoordinatorEventProcessor(
             ZooKeeperClient zooKeeperClient,
@@ -301,6 +305,15 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                             ConfigOptions.COORDINATOR_OFFLINE_LEADER_RETRY_DELAY.key(),
                             offlineLeaderRetryDelayMs));
         }
+        this.newBucketRetryDelayMs =
+                conf.get(ConfigOptions.COORDINATOR_NEW_BUCKET_RETRY_DELAY).toMillis();
+        if (newBucketRetryDelayMs <= 0) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "%s must be positive, but was %d ms.",
+                            ConfigOptions.COORDINATOR_NEW_BUCKET_RETRY_DELAY.key(),
+                            newBucketRetryDelayMs));
+        }
         this.scheduler = scheduler;
         this.ioExecutor = ioExecutor;
         this.lakeTableHelper = new LakeTableHelper(zooKeeperClient);
@@ -328,6 +341,11 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         return offlineLeaderRetryTask != null;
     }
 
+    @VisibleForTesting
+    boolean hasNewBucketRetryTaskScheduled() {
+        return newBucketRetryTask != null;
+    }
+
     public void startup() {
         CoordinatorAddress coordinatorAddress = getCoordinatorLeaderAddress();
         coordinatorContext.setCoordinatorServerId(coordinatorAddress.getId());
@@ -352,6 +370,10 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
 
         // start table manager
         tableManager.startup();
+        // Buckets may fail their initial LeaderAndIsr registration (e.g. a transient
+        // ZooKeeper failure). Schedule a retry so that they are not stranded in NewBucket
+        // until an unrelated tablet-server event happens to trigger a rescan.
+        scheduleNewBucketRetryIfNeeded();
 
         // start the event manager which will then process the event
         coordinatorEventManager.start();
@@ -362,6 +384,7 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
 
     public void shutdown() {
         clearOfflineLeaderRetryTask();
+        clearNewBucketRetryTask();
         // Cancel periodic event producers before stopping the event loop.
         rebalanceManager.stopTimeoutChecker();
         // close the event manager
@@ -733,6 +756,8 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                     (NotifyLeaderAndIsrResponseReceivedEvent) event);
         } else if (event instanceof RetryOfflineLeaderEvent) {
             processRetryOfflineLeader();
+        } else if (event instanceof RetryNewBucketEvent) {
+            processRetryNewBucket();
         } else if (event instanceof DeleteReplicaResponseReceivedEvent) {
             processDeleteReplicaResponseReceived((DeleteReplicaResponseReceivedEvent) event);
         } else if (event instanceof NewCoordinatorEvent) {
@@ -901,6 +926,9 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
 
         replicaStateMachine.handleStateChanges(offlineReplicas, OnlineReplica);
         tableBucketStateMachine.triggerOnlineBucketStateChange();
+        // The rescan may still leave buckets in NewBucket if their LeaderAndIsr registration
+        // failed; make sure a retry is pending for them.
+        scheduleNewBucketRetryIfNeeded();
     }
 
     private Set<TableBucketReplica> retryableOfflineReplicasOnLiveTabletServers() {
@@ -918,6 +946,67 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         if (offlineLeaderRetryTask != null) {
             offlineLeaderRetryTask.cancel(false);
             offlineLeaderRetryTask = null;
+        }
+    }
+
+    /**
+     * Schedules a one-shot retry of the NewBucket initialization if there are buckets still in
+     * NewBucket state, mirroring {@link #scheduleOfflineLeaderRetryIfNeeded()}. The scheduled task
+     * only enqueues {@link RetryNewBucketEvent}; the actual rescan runs on the coordinator event
+     * thread. Must be called from the coordinator event thread (or before the event manager
+     * starts).
+     */
+    private void scheduleNewBucketRetryIfNeeded() {
+        if (newBucketRetryTask != null) {
+            return;
+        }
+
+        Set<TableBucket> retryableNewBuckets =
+                coordinatorContext
+                        .bucketsInStates(Collections.singleton(BucketState.NewBucket))
+                        .stream()
+                        .filter(tableBucket -> !coordinatorContext.isToBeDeleted(tableBucket))
+                        .collect(Collectors.toSet());
+        if (retryableNewBuckets.isEmpty()) {
+            return;
+        }
+
+        newBucketRetryTask =
+                scheduler.scheduleOnce(
+                        "new-bucket-retry",
+                        this::enqueueRetryNewBucketEventSafely,
+                        newBucketRetryDelayMs);
+        LOG.info(
+                "NewBucket retry task scheduled after {} ms for {} buckets: {}.",
+                newBucketRetryDelayMs,
+                retryableNewBuckets.size(),
+                retryableNewBuckets);
+    }
+
+    private void enqueueRetryNewBucketEventSafely() {
+        try {
+            coordinatorEventManager.put(new RetryNewBucketEvent());
+        } catch (Throwable t) {
+            LOG.warn("Failed to enqueue retry NewBucket event.", t);
+        }
+    }
+
+    private void processRetryNewBucket() {
+        // This event consumes the currently scheduled one-shot retry. If the initialization
+        // below fails again (for example the LeaderAndIsr registration in ZooKeeper), the
+        // buckets stay in NewBucket and this method schedules the next one-shot retry, so the
+        // retry chain continues until all buckets leave the NewBucket state.
+        clearNewBucketRetryTask();
+
+        tableBucketStateMachine.triggerOnlineBucketStateChange();
+
+        scheduleNewBucketRetryIfNeeded();
+    }
+
+    private void clearNewBucketRetryTask() {
+        if (newBucketRetryTask != null) {
+            newBucketRetryTask.cancel(false);
+            newBucketRetryTask = null;
         }
     }
 
@@ -965,6 +1054,10 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                     null,
                     Collections.emptySet());
         }
+
+        // The newly created buckets start in NewBucket state. If their initial LeaderAndIsr
+        // registration fails, retry instead of waiting for an unrelated tablet-server event.
+        scheduleNewBucketRetryIfNeeded();
     }
 
     private void processSchemaChange(SchemaChangeEvent schemaChangeEvent) {
@@ -1166,6 +1259,11 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                 null,
                 null,
                 tableBuckets);
+
+        // The newly created partition buckets start in NewBucket state. If their initial
+        // LeaderAndIsr registration fails, retry instead of waiting for an unrelated
+        // tablet-server event.
+        scheduleNewBucketRetryIfNeeded();
     }
 
     private void processDropTable(DropTableEvent dropTableEvent) {
@@ -1477,6 +1575,9 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         // and offline partitions to see if those tablet servers become leaders for some/all
         // of those
         tableBucketStateMachine.triggerOnlineBucketStateChange();
+        // The rescan may still leave buckets in NewBucket if their LeaderAndIsr registration
+        // failed; make sure a retry is pending for them.
+        scheduleNewBucketRetryIfNeeded();
     }
 
     private void processDeadTabletServer(DeadTabletServerEvent deadTabletServerEvent) {
@@ -1525,6 +1626,9 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
 
         // trigger online state changes for offline or new buckets
         tableBucketStateMachine.triggerOnlineBucketStateChange();
+        // The rescan may still leave buckets in NewBucket if their LeaderAndIsr registration
+        // failed; make sure a retry is pending for them.
+        scheduleNewBucketRetryIfNeeded();
 
         // get all replicas in this server and is not to be deleted
         Set<TableBucketReplica> replicas =

@@ -296,6 +296,19 @@ public class ConfigOptions {
                                     + "conditions, such as disk write protection, become electable "
                                     + "again after recovery.");
 
+    public static final ConfigOption<Duration> COORDINATOR_NEW_BUCKET_RETRY_DELAY =
+            key("coordinator.new-bucket.retry-delay")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription(
+                            "The delay before the coordinator retries the initialization of "
+                                    + "buckets that remain in the NewBucket state, for example "
+                                    + "because their LeaderAndIsr registration in ZooKeeper "
+                                    + "failed. Without this retry, such buckets would only be "
+                                    + "re-attempted when a tablet-server event happens to "
+                                    + "trigger a rescan, and would otherwise stay in "
+                                    + "NewBucket forever.");
+
     public static final ConfigOption<Boolean> LOG_TABLE_ALLOW_CREATION =
             key("allow.create.log.tables")
                     .booleanType()
